@@ -100,8 +100,9 @@ git clone <repository url> MoneroCarrot
 cd MoneroCarrot
 copy secrets.example.h secrets.h        # put your keys into secrets.h
 .\build.cmd -Port COM5                  # build and flash (the board's COM port)
-py -m pip install -r tools\mwlink\requirements.txt
-py tools\mwlink\mwlink_gui.py           # Connect -> device ready
+py -m venv .venv                        # Python environment inside the project
+.venv\Scripts\pip install --no-cache-dir -r tools\mwlink\requirements.txt
+.venv\Scripts\python tools\mwlink\mwlink_gui.py     # Connect -> device ready
 ```
 
 Then in monero-wallet-gui: **Create** → file to the device → **Submit**
@@ -142,6 +143,21 @@ create wallets with the new Carrot key hierarchy.
 
 The script downloads arduino-cli, installs the esp32 core, builds with the
 right settings and flashes. The first run downloads about 1 GB of tools.
+
+Everything stays inside the project folder; nothing is installed into the
+system or your user profile, and no administrator rights are needed:
+
+| Folder | Contents |
+|---|---|
+| `build/tools/` | the script's own copy of arduino-cli (pinned version) |
+| `build/arduino/` | esp32 core and toolchains, download cache, build cache, arduino-cli settings |
+| `build/out-<usb>/`, `build/sketch/` | intermediate build files |
+| `dist/<usb>/` | firmware images |
+
+An Arduino IDE or arduino-cli already installed on the PC is neither used nor
+changed. To remove everything, delete `build/` and `dist/`; if Explorer
+complains about long paths inside `build/arduino`, use `rmdir /s /q build`
+in a console.
 
 **Windows** (double-click `build.cmd` or run it from a console):
 
@@ -223,7 +239,7 @@ restart.
 ### First check
 
 ```powershell
-py tools\mwlink\mwlink.py info
+.venv\Scripts\python tools\mwlink\mwlink.py info
 ```
 
 ```
@@ -245,9 +261,16 @@ The program moves files between a folder on the PC and the device and shows
 the device log. Details: [tools/mwlink/README.md](tools/mwlink/README.md).
 
 ```powershell
-py -m pip install -r tools\mwlink\requirements.txt    # pyserial, hidapi
-py tools\mwlink\mwlink_gui.py
+py -m venv .venv
+.venv\Scripts\pip install --no-cache-dir -r tools\mwlink\requirements.txt   # pyserial, hidapi
+.venv\Scripts\python tools\mwlink\mwlink_gui.py
 ```
+
+The `.venv` folder in the project keeps the Python packages away from your
+system Python; `--no-cache-dir` stops pip from caching downloads in your
+profile. On Linux/macOS: `python3 -m venv .venv`,
+`.venv/bin/pip install --no-cache-dir -r tools/mwlink/requirements.txt`,
+`.venv/bin/python tools/mwlink/mwlink_gui.py`.
 
 1. **Connect.** The device is found automatically: HID first, then the COM
    port.

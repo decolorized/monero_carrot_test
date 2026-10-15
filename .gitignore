@@ -26,6 +26,7 @@ test/refharness
 test/pty.txt
 
 # Python / editors / OS
+.venv/
 __pycache__/
 *.pyc
 .vscode/

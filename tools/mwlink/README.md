@@ -5,11 +5,17 @@ mwlink protocol 3) and shows the device log. The program never sees keys: the
 files are encrypted by the wallets, and every conversion happens on the
 device.
 
+From the project root (Windows; the packages go into `.venv` in the project,
+not into the system Python):
+
 ```
-pip install -r requirements.txt     # pyserial, hidapi
-python mwlink_gui.py                # window
-python mwlink.py --help             # command line
+py -m venv .venv
+.venv\Scripts\pip install --no-cache-dir -r tools\mwlink\requirements.txt
+.venv\Scripts\python tools\mwlink\mwlink_gui.py      # window
+.venv\Scripts\python tools\mwlink\mwlink.py --help   # command line
 ```
+
+On Linux/macOS use `python3 -m venv .venv` and `.venv/bin/...`.
 
 `hidapi` is needed only for HID; without it the program uses the COM port.
 

@@ -3,10 +3,22 @@
     Build (and optionally flash) the MoneroCarrot firmware with arduino-cli.
 
 .DESCRIPTION
-    Downloads arduino-cli if it is not installed, installs the esp32 Arduino
-    core, compiles the sketch for ESP32-S3-DevKitC-1 and, with -Port, flashes it.
-    Results: dist\<usb>\MoneroCarrot.ino.merged.bin (whole flash image) and
-    the separate bootloader / partitions / app images.
+    Self-contained: everything the build needs is downloaded into the build\
+    folder of this project, nothing is installed into the system or the user
+    profile.
+
+        build\tools\arduino-cli.exe   arduino-cli (own copy, pinned version)
+        build\arduino\                esp32 core, toolchains, download cache,
+                                      core build cache, arduino-cli settings
+        build\out-<usb>\              intermediate build files
+        dist\<usb>\                   firmware images
+
+    Delete build\ and dist\ to remove everything. Any Arduino IDE or
+    arduino-cli already installed on the PC is neither used nor changed.
+
+    Results: dist\<usb>\MoneroCarrot.ino.merged.bin (whole flash image) and the
+    separate bootloader / partitions / app images. They contain the keys from
+    secrets.h: never publish them.
 
     Before the first build copy secrets.example.h to secrets.h and put your
     wallet keys there (see README.md).
@@ -49,33 +61,48 @@ if (-not (Test-Path (Join-Path $Root 'secrets.h'))) {
     throw "secrets.h not found. Copy secrets.example.h to secrets.h and put your wallet keys there."
 }
 
-# --- arduino-cli ----------------------------------------------------------------
-$cmd = Get-Command arduino-cli -ErrorAction SilentlyContinue
-if ($cmd) {
-    $Cli = $cmd.Source
-} else {
-    $ToolDir = Join-Path $Root 'build\tools'
-    $Cli = Join-Path $ToolDir 'arduino-cli.exe'
-    if (-not (Test-Path $Cli)) {
-        Step "downloading arduino-cli $CliVersion"
-        New-Item -ItemType Directory -Force -Path $ToolDir | Out-Null
-        $zip = Join-Path $ToolDir 'arduino-cli.zip'
-        $url = "https://github.com/arduino/arduino-cli/releases/download/v$CliVersion/arduino-cli_${CliVersion}_Windows_64bit.zip"
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-        Expand-Archive -Path $zip -DestinationPath $ToolDir -Force
-        Remove-Item $zip
-    }
+# --- arduino-cli: own copy in build\tools ---------------------------------------
+$ToolDir = Join-Path $Root 'build\tools'
+$Cli = Join-Path $ToolDir 'arduino-cli.exe'
+if (-not (Test-Path $Cli)) {
+    Step "downloading arduino-cli $CliVersion into $ToolDir"
+    New-Item -ItemType Directory -Force -Path $ToolDir | Out-Null
+    $zip = Join-Path $ToolDir 'arduino-cli.zip'
+    $url = "https://github.com/arduino/arduino-cli/releases/download/v$CliVersion/arduino-cli_${CliVersion}_Windows_64bit.zip"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    Expand-Archive -Path $zip -DestinationPath $ToolDir -Force
+    Remove-Item $zip
 }
-Step "arduino-cli: $Cli"
+
+# --- arduino-cli settings: all its folders inside build\arduino ---------------------
+$ArduinoDir = Join-Path $Root 'build\arduino'
+New-Item -ItemType Directory -Force -Path $ArduinoDir | Out-Null
+$Config = Join-Path $ArduinoDir 'arduino-cli.yaml'
+$a = $ArduinoDir.Replace('\', '/')
+@"
+directories:
+  data: '$a/data'
+  downloads: '$a/staging'
+  user: '$a/user'
+build_cache:
+  path: '$a/cache'
+board_manager:
+  additional_urls:
+    - '$IndexUrl'
+updater:
+  enable_notification: false
+"@ | Set-Content -Path $Config -Encoding ASCII
+
+function Invoke-ArduinoCli { & $Cli --config-file $Config @args }
 
 # --- esp32 core -------------------------------------------------------------------
-$installed = (& $Cli core list 2>$null | Out-String)
+$installed = (Invoke-ArduinoCli core list 2>$null | Out-String)
 if ($installed -notmatch "esp32:esp32\s+$([regex]::Escape($Core))\b") {
-    Step "installing esp32 core $Core (first run downloads ~1 GB of toolchains)"
-    & $Cli core update-index --additional-urls $IndexUrl
+    Step "installing esp32 core $Core into $ArduinoDir (first run downloads ~1 GB)"
+    Invoke-ArduinoCli core update-index
     if ($LASTEXITCODE -ne 0) { throw "arduino-cli core update-index failed" }
-    & $Cli core install "esp32:esp32@$Core" --additional-urls $IndexUrl
+    Invoke-ArduinoCli core install "esp32:esp32@$Core" --skip-post-install
     if ($LASTEXITCODE -ne 0) { throw "arduino-cli core install failed" }
 }
 
@@ -95,14 +122,14 @@ $Out = Join-Path $Root "dist\$Usb"
 $BuildPath = Join-Path $Root "build\out-$Usb"
 
 Step "compiling ($Fqbn)"
-& $Cli compile --fqbn $Fqbn --build-path $BuildPath --output-dir $Out $Stage
+Invoke-ArduinoCli compile --fqbn $Fqbn --build-path $BuildPath --output-dir $Out $Stage
 if ($LASTEXITCODE -ne 0) { throw "compilation failed" }
 Step "firmware: $Out"
 
 # --- flashing ---------------------------------------------------------------------------
 if ($Port) {
     Step "flashing through $Port"
-    & $Cli upload -p $Port --fqbn $Fqbn --input-dir $Out $Stage
+    Invoke-ArduinoCli upload -p $Port --fqbn $Fqbn --input-dir $Out $Stage
     if ($LASTEXITCODE -ne 0) {
         throw "upload failed: hold BOOT, press and release RESET, release BOOT, then run again"
     }

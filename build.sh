@@ -8,6 +8,9 @@
 #
 # Options: --usb otg|hwcdc  --psram opi|qspi  --flash 8M|16M|32M  --port PORT
 #          --core VERSION (esp32 Arduino core, default 3.3.12)
+# Self-contained: arduino-cli, the esp32 core and all caches are downloaded into
+# build/ of this project; nothing goes into the system or the home folder.
+# Delete build/ and dist/ to remove everything.
 # Results: dist/<usb>/MoneroCarrot.ino.merged.bin and the separate images.
 # The image contains your keys from secrets.h: never publish it.
 set -euo pipefail
@@ -20,7 +23,7 @@ while [ $# -gt 0 ]; do
         --flash) FLASH="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --core) CORE="$2"; shift 2 ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -37,32 +40,45 @@ step() { printf '==> %s\n' "$*"; }
     exit 1
 }
 
-# arduino-cli: from PATH or downloaded into build/tools
-if command -v arduino-cli >/dev/null 2>&1; then
-    CLI="$(command -v arduino-cli)"
-else
-    CLI="$ROOT/build/tools/arduino-cli"
-    if [ ! -x "$CLI" ]; then
-        case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64) PKG=Linux_64bit ;;
-            Linux-aarch64) PKG=Linux_ARM64 ;;
-            Darwin-arm64) PKG=macOS_ARM64 ;;
-            Darwin-x86_64) PKG=macOS_64bit ;;
-            *) echo "install arduino-cli manually: https://arduino.github.io/arduino-cli/" >&2; exit 1 ;;
-        esac
-        step "downloading arduino-cli $CLI_VERSION"
-        mkdir -p "$ROOT/build/tools"
-        curl -fsSL "https://github.com/arduino/arduino-cli/releases/download/v$CLI_VERSION/arduino-cli_${CLI_VERSION}_$PKG.tar.gz" |
-            tar -xz -C "$ROOT/build/tools" arduino-cli
-    fi
+# arduino-cli: own copy in build/tools (ARDUINO_CLI=/path overrides)
+CLI="${ARDUINO_CLI:-$ROOT/build/tools/arduino-cli}"
+if [ ! -x "$CLI" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64) PKG=Linux_64bit ;;
+        Linux-aarch64) PKG=Linux_ARM64 ;;
+        Darwin-arm64) PKG=macOS_ARM64 ;;
+        Darwin-x86_64) PKG=macOS_64bit ;;
+        *) echo "unsupported system: set ARDUINO_CLI to an arduino-cli binary" >&2; exit 1 ;;
+    esac
+    step "downloading arduino-cli $CLI_VERSION into build/tools"
+    mkdir -p "$ROOT/build/tools"
+    curl -fsSL "https://github.com/arduino/arduino-cli/releases/download/v$CLI_VERSION/arduino-cli_${CLI_VERSION}_$PKG.tar.gz" |
+        tar -xz -C "$ROOT/build/tools" arduino-cli
 fi
-step "arduino-cli: $CLI"
+
+# arduino-cli settings: all its folders inside build/arduino
+A="$ROOT/build/arduino"
+mkdir -p "$A"
+CONFIG="$A/arduino-cli.yaml"
+printf '%s\n' \
+    "directories:" \
+    "  data: '$A/data'" \
+    "  downloads: '$A/staging'" \
+    "  user: '$A/user'" \
+    "build_cache:" \
+    "  path: '$A/cache'" \
+    "board_manager:" \
+    "  additional_urls:" \
+    "    - '$INDEX_URL'" \
+    "updater:" \
+    "  enable_notification: false" > "$CONFIG"
+cli() { "$CLI" --config-file "$CONFIG" "$@"; }
 
 # esp32 core
-if ! "$CLI" core list 2>/dev/null | grep -Eq "^esp32:esp32[[:space:]]+$CORE([[:space:]]|$)"; then
-    step "installing esp32 core $CORE (first run downloads ~1 GB of toolchains)"
-    "$CLI" core update-index --additional-urls "$INDEX_URL"
-    "$CLI" core install "esp32:esp32@$CORE" --additional-urls "$INDEX_URL"
+if ! cli core list 2>/dev/null | grep -Eq "^esp32:esp32[[:space:]]+$CORE([[:space:]]|$)"; then
+    step "installing esp32 core $CORE into build/arduino (first run downloads ~1 GB)"
+    cli core update-index
+    cli core install "esp32:esp32@$CORE" --skip-post-install
 fi
 
 # sketch copy: the folder name must match the .ino, whatever the repo is called
@@ -75,12 +91,12 @@ done
 FQBN="esp32:esp32:esp32s3:USBMode=$USBMODE,CDCOnBoot=cdc,PSRAM=$PSRAMOPT,FlashSize=$FLASH,DebugLevel=none"
 OUT="$ROOT/dist/$USB"
 step "compiling ($FQBN)"
-"$CLI" compile --fqbn "$FQBN" --build-path "$ROOT/build/out-$USB" --output-dir "$OUT" "$STAGE"
+cli compile --fqbn "$FQBN" --build-path "$ROOT/build/out-$USB" --output-dir "$OUT" "$STAGE"
 step "firmware: $OUT"
 
 if [ -n "$PORT" ]; then
     step "flashing through $PORT"
-    "$CLI" upload -p "$PORT" --fqbn "$FQBN" --input-dir "$OUT" "$STAGE" || {
+    cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$OUT" "$STAGE" || {
         echo "upload failed: hold BOOT, press and release RESET, release BOOT, then run again" >&2
         exit 1
     }
