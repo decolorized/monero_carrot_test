@@ -1,0 +1,798 @@
+// MoneroColdWallet.ino
+//
+// ESP32-S3 крипто-модуль холодного кошелька Monero.
+//
+// Протокол:
+//   [0xAA][TYPE:1][LEN:2 LE][PAYLOAD...][CRC16:2 LE]
+//
+// TYPE:
+//   0x01  TYPE_OUTPUTS_BIN      host -> device   hex(outputs.bin)
+//   0x02  TYPE_KEYIMAGES_OUT    device -> host   hex(keyimages.bin)
+//   0x03  TYPE_LOG              device -> host   ASCII
+//   0x04  TYPE_GET_SPEND_PUBKEY host -> device   пусто
+//   0x05  TYPE_SPEND_PUBKEY_OUT device -> host   hex(pubkey:32)
+//   0x06  TYPE_PING             host -> device   пусто
+//   0x07  TYPE_PONG             device -> host   "PONG"
+//   0x10  TYPE_TX_BIN           host -> device   hex(tx.bin)
+//   0x11  TYPE_TX_SIGNED        device -> host   hex(tx-signed.bin)
+//   0x20  TYPE_PT_DUMP          device -> host   RAW plaintext (только для отладки)
+//   0x30  TYPE_DECRYPT_TX_SET   host -> device   hex(signed_tx_set / unsigned_tx_set)
+//   0x31  TYPE_DECRYPT_TX_OUT   device -> host   RAW plaintext (chunked)
+//   0x32  TYPE_DECRYPT_TX_END   device -> host   "END" маркер конца
+//   0xFF  TYPE_ERROR            device -> host   ASCII
+
+#include <Arduino.h>
+#include <stdarg.h>
+#include <esp_random.h>
+#include "esp_task_wdt.h"
+
+extern "C" {
+// bootloader_random_enable(): включает SAR-ADC как источник энтропии.
+// Если заголовка нет в вашей версии ядра — символы всё равно есть
+// в libbootloader_support.a, объявления ниже достаточно.
+void bootloader_random_enable(void);
+void bootloader_random_disable(void);
+}
+#include "secrets.h"
+#include "monero_crypto.h"
+#include "outputs_parser.h"
+#include "keyimages_writer.h"
+#include "tx_parser.h"
+#include "sign_tx.h"
+
+extern "C" {
+#include "crypto-ops.h"
+#include "chacha20.h"
+#include "unsigned_tx_set.h"
+}
+
+// ---------------------------------------------------------------------------
+// Объявление cn_slow_hash ДО первого использования
+// ---------------------------------------------------------------------------
+extern "C" void cn_slow_hash(const void *data, size_t length, char *hash,
+                             int variant, int prehashed, uint64_t height);
+
+// ---------------------------------------------------------------------------
+// RGB LED — ОТКЛЮЧЁН.
+// ---------------------------------------------------------------------------
+enum LedState { LED_OFF, LED_BOOT, LED_SELFTEST, LED_READY,
+                LED_BUSY, LED_DONE, LED_ERROR };
+static inline void led_set(LedState) { /* no-op */ }
+
+// ---------------------------------------------------------------------------
+// КЛЮЧИ. Без static — sign_tx.c обращается к ним через extern.
+// ---------------------------------------------------------------------------
+extern "C" {
+uint8_t g_spend_secret_key[32];
+uint8_t g_spend_public_key[32];
+uint8_t g_view_secret_key[32];
+uint8_t g_view_public_key[32];
+}
+
+// ---------------------------------------------------------------------------
+// Протокол
+// ---------------------------------------------------------------------------
+#define FRAME_START 0xAA
+
+#define TYPE_OUTPUTS_BIN        0x01
+#define TYPE_KEYIMAGES_OUT      0x02
+#define TYPE_LOG                0x03
+#define TYPE_GET_SPEND_PUBKEY   0x04
+#define TYPE_SPEND_PUBKEY_OUT   0x05
+#define TYPE_PING               0x06
+#define TYPE_PONG               0x07
+#define TYPE_TX_BIN             0x10
+#define TYPE_TX_SIGNED          0x11
+#define TYPE_PT_DUMP            0x20
+#define TYPE_DECRYPT_TX_SET     0x30
+#define TYPE_DECRYPT_TX_OUT     0x31
+#define TYPE_DECRYPT_TX_END     0x32
+#define TYPE_ERROR              0xFF
+
+// Максимум payload в hex. Ограничен uint16_t LEN в заголовке (65535).
+#define MAX_HEX_PAYLOAD         65520
+#define MAX_BIN_PAYLOAD         (MAX_HEX_PAYLOAD / 2)
+
+static volatile uint32_t g_tx_sent = 0;
+static volatile uint32_t rx_total_bytes = 0;
+static volatile uint32_t rx_frames_ok = 0;
+static volatile uint32_t rx_frames_bad = 0;
+
+// ---------------------------------------------------------------------------
+// Буферы
+// ---------------------------------------------------------------------------
+static uint8_t *g_resp_bin       = nullptr;  // SRAM,  MAX_BIN_PAYLOAD (32 КБ)
+static uint8_t *g_tx_signed_buf  = nullptr;  // SRAM,  MAX_BIN_PAYLOAD (32 КБ)
+
+static uint8_t *g_rx_payload     = nullptr;  // PSRAM, MAX_HEX_PAYLOAD (64 КБ)
+static uint8_t *g_resp_hex       = nullptr;  // PSRAM, MAX_HEX_PAYLOAD (64 КБ)
+static uint8_t *g_tx_signed_hex  = nullptr;  // PSRAM, MAX_HEX_PAYLOAD (64 КБ)
+
+// parsed_outputs теперь в PSRAM (не на стеке loopTask).
+static parsed_outputs *g_po = nullptr;
+
+// ---------------------------------------------------------------------------
+// CRC16-CCITT
+// ---------------------------------------------------------------------------
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                                 : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+// ---------------------------------------------------------------------------
+// send_frame
+// ---------------------------------------------------------------------------
+static void send_frame(uint8_t type, const uint8_t *payload, uint16_t len) {
+    uint16_t crc = crc16_ccitt(payload, len);
+    uint8_t hdr[4] = {
+        FRAME_START, type,
+        (uint8_t)(len & 0xFF),
+        (uint8_t)((len >> 8) & 0xFF)
+    };
+    uint8_t tail[2] = { (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF) };
+
+    Serial.write(hdr, sizeof(hdr));
+    if (len) Serial.write(payload, len);
+    Serial.write(tail, sizeof(tail));
+    Serial.flush();
+
+    g_tx_sent++;
+}
+
+static void send_error(const char *msg) {
+    send_frame(TYPE_ERROR, (const uint8_t *)msg, (uint16_t)strlen(msg));
+}
+
+extern "C" void platform_log(const char *msg) {
+    send_frame(TYPE_LOG, (const uint8_t *)msg, (uint16_t)strlen(msg));
+}
+
+extern "C" void platform_send_pt_dump(const uint8_t *data, size_t len) {
+    send_frame(TYPE_PT_DUMP, data, (uint16_t)len);
+}
+
+extern "C" void platform_random_bytes(uint8_t *buf, size_t n) {
+    // esp_fill_random() — ровно этот же цикл внутри ESP-IDF, но одно место
+    // вместо двух. Качество обеспечивается bootloader_random_enable() в setup().
+    esp_fill_random(buf, n);
+}
+
+// Грубая проверка, что ГСЧ вообще живой: залипший регистр или повтор 32-битного
+// слова на 32 выборках. Предсказуемый, но корректно выглядящий поток так не
+// поймать — от этого защищает bootloader_random_enable() и хеджирование нонсов.
+static bool rng_selftest() {
+    uint32_t w[32];
+    for (int i = 0; i < 32; i++) w[i] = esp_random();
+    uint32_t any = 0, all = 0xFFFFFFFFu;
+    for (int i = 0; i < 32; i++) { any |= w[i]; all &= w[i]; }
+    if (any == 0 || all == 0xFFFFFFFFu) return false;
+    for (int i = 0; i < 32; i++)
+        for (int j = i + 1; j < 32; j++)
+            if (w[i] == w[j]) return false;
+    return true;
+}
+
+static void send_diag_line(const char *fmt, ...) {
+    char buf[220];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+    send_frame(TYPE_LOG, (const uint8_t *)buf, (uint16_t)n);
+}
+
+// ---------------------------------------------------------------------------
+// hex helpers
+// ---------------------------------------------------------------------------
+static int hex_nib(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_decode(const uint8_t *hex, uint16_t hex_len,
+                      uint8_t *out, size_t out_cap) {
+    if (hex_len % 2 != 0) return -1;
+    size_t n = hex_len / 2;
+    if (n > out_cap) return -1;
+    for (size_t i = 0; i < n; i++) {
+        int hi = hex_nib((char)hex[i * 2]);
+        int lo = hex_nib((char)hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return (int)n;
+}
+
+static uint16_t hex_encode(const uint8_t *in, size_t n,
+                           uint8_t *out, size_t out_cap) {
+    static const char tbl[] = "0123456789abcdef";
+    if (n * 2 > out_cap) return 0;
+    if (n * 2 > 0xFFFF) return 0;
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2]     = (uint8_t)tbl[(in[i] >> 4) & 0xF];
+        out[i * 2 + 1] = (uint8_t)tbl[in[i] & 0xF];
+    }
+    return (uint16_t)(n * 2);
+}
+
+static bool hex_to_bytes(const char *hex, uint8_t *out, size_t out_len) {
+    if (strlen(hex) != out_len * 2) return false;
+    for (size_t i = 0; i < out_len; i++) {
+        int h = hex_nib(hex[i * 2]);
+        int l = hex_nib(hex[i * 2 + 1]);
+        if (h < 0 || l < 0) return false;
+        out[i] = (uint8_t)((h << 4) | l);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// rx parser
+// ---------------------------------------------------------------------------
+enum RxState {
+    WAIT_START, WAIT_TYPE, WAIT_LEN0, WAIT_LEN1,
+    WAIT_PAYLOAD, WAIT_CRC0, WAIT_CRC1
+};
+
+static RxState  rx_state = WAIT_START;
+static uint8_t  rx_type;
+static uint16_t rx_len, rx_pos;
+static uint16_t rx_crc_recv;
+
+static void handle_frame(uint8_t type, const uint8_t *payload, uint16_t len);
+
+#define RX_CHUNK 8192
+
+static void rx_poll() {
+    int budget = RX_CHUNK;
+    while (budget-- > 0 && Serial.available() > 0) {
+        uint8_t b = (uint8_t)Serial.read();
+        rx_total_bytes++;
+
+        switch (rx_state) {
+            case WAIT_START:
+                if (b == FRAME_START) rx_state = WAIT_TYPE;
+                break;
+            case WAIT_TYPE:
+                rx_type = b; rx_state = WAIT_LEN0; break;
+            case WAIT_LEN0:
+                rx_len = b; rx_state = WAIT_LEN1; break;
+            case WAIT_LEN1:
+                rx_len |= ((uint16_t)b) << 8;
+                rx_pos = 0;
+                if (rx_len > MAX_HEX_PAYLOAD) {
+                    send_diag_line("rx: len=%u > max=%u, drop",
+                                   (unsigned)rx_len, (unsigned)MAX_HEX_PAYLOAD);
+                    rx_state = WAIT_START;
+                    rx_frames_bad++;
+                    break;
+                }
+                rx_state = (rx_len == 0) ? WAIT_CRC0 : WAIT_PAYLOAD;
+                break;
+            case WAIT_PAYLOAD:
+                g_rx_payload[rx_pos++] = b;
+                if (rx_pos == rx_len) rx_state = WAIT_CRC0;
+                break;
+            case WAIT_CRC0:
+                rx_crc_recv = b; rx_state = WAIT_CRC1; break;
+            case WAIT_CRC1: {
+                rx_crc_recv |= ((uint16_t)b) << 8;
+                uint16_t crc_calc = crc16_ccitt(g_rx_payload, rx_len);
+                if (crc_calc == rx_crc_recv) {
+                    rx_frames_ok++;
+                    handle_frame(rx_type, g_rx_payload, rx_len);
+                } else {
+                    rx_frames_bad++;
+                    send_diag_line("rx: CRC mismatch type=0x%02x len=%u got=%04x calc=%04x",
+                                   (unsigned)rx_type, (unsigned)rx_len,
+                                   (unsigned)rx_crc_recv, (unsigned)crc_calc);
+                }
+                rx_state = WAIT_START;
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// outputs.bin handler
+// ---------------------------------------------------------------------------
+static void handle_outputs_bin(const uint8_t *payload, uint16_t len) {
+    send_diag_line("outputs: STAGE 1/8 - hex payload, %u bytes", (unsigned)len);
+
+    uint32_t t0 = millis();
+    int bin_len = hex_decode(payload, len, g_resp_bin, MAX_BIN_PAYLOAD);
+    if (bin_len < 0) { send_error("hex decode failed"); return; }
+    send_diag_line("outputs: STAGE 2/8 - decoded %d bytes in %u ms",
+                   bin_len, (unsigned)(millis() - t0));
+    if (bin_len == 0) { send_error("hex empty"); return; }
+
+    {
+        char m[32];
+        size_t mlen = (bin_len < 23) ? (size_t)bin_len : 23;
+        memcpy(m, g_resp_bin, mlen);
+        m[mlen] = 0;
+        for (size_t i = 0; i < mlen; i++) {
+            if ((uint8_t)m[i] < 0x20 || (uint8_t)m[i] > 0x7e) m[i] = '.';
+        }
+        send_diag_line("outputs: STAGE 3/8 - magic='%s'", m);
+    }
+
+    // ------------------------------------------------------------------
+    // g_po — в PSRAM, выделяется один раз.
+    // ------------------------------------------------------------------
+    if (!g_po) {
+        g_po = (parsed_outputs *)heap_caps_malloc(
+            sizeof(parsed_outputs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_po) { send_error("g_po alloc failed"); return; }
+    }
+
+    t0 = millis();
+    if (!parse_outputs_bin(g_resp_bin, (size_t)bin_len, g_view_secret_key, g_po)) {
+        send_error("outputs parse/decrypt/sig fail");
+        return;
+    }
+    send_diag_line("outputs: STAGE 4/8 - parsed %u records in %u ms, data_size=%u",
+                   (unsigned)g_po->count, (unsigned)(millis() - t0),
+                   (unsigned)g_po->data_size);
+
+    // recs[] — static, не на стеке.
+    static keyimage_record g_recs[OUTPUTS_MAX_RECORDS];
+    size_t n = 0;
+    uint32_t offset = 0;
+
+    for (size_t i = 0; i < g_po->count; i++) {
+        output_record *r = &g_po->records[i];
+        uint8_t ki[32], c[32], s[32];
+
+        send_diag_line("  rec[%u]: signing...", (unsigned)i);
+        uint32_t tt = millis();
+        bool ok = derive_and_sign_key_image_from_viewkey(
+            r->tx_pubkey, r->internal_index, r->pubkey,
+            g_view_secret_key, g_spend_secret_key,
+            ki, c, s,
+            r->subaddr_major, r->subaddr_minor);
+        uint32_t dt = millis() - tt;
+
+        if (!ok) {
+            send_diag_line("  rec[%u]: SKIP in %u ms", (unsigned)i, (unsigned)dt);
+            continue;
+        }
+        send_diag_line("  rec[%u]: ok in %u ms", (unsigned)i, (unsigned)dt);
+
+        memcpy(g_recs[n].key_image, ki, 32);
+        memcpy(g_recs[n].sig_c,     c,  32);
+        memcpy(g_recs[n].sig_r,     s,  32);
+        n++;
+    }
+    send_diag_line("outputs: STAGE 5/8 - derived %u/%u key images",
+                   (unsigned)n, (unsigned)g_po->count);
+
+    t0 = millis();
+    size_t out_len = build_keyimages_bin(
+        g_view_secret_key, g_spend_public_key, g_view_public_key,
+        offset, g_recs, n,
+        g_resp_bin, MAX_BIN_PAYLOAD);
+    send_diag_line("outputs: STAGE 6/8 - built keyimages.bin: %u bytes in %u ms",
+                   (unsigned)out_len, (unsigned)(millis() - t0));
+
+    free_parsed_outputs(g_po);
+
+    if (out_len == 0) { send_error("keyimages build fail"); return; }
+
+    uint16_t resp_hex_len = hex_encode(g_resp_bin, out_len,
+                                       g_resp_hex, MAX_HEX_PAYLOAD);
+    if (resp_hex_len == 0) { send_error("encode"); return; }
+
+    send_diag_line("outputs: STAGE 7/8 - hex %u bytes, sending KEYIMAGES_OUT",
+                   (unsigned)resp_hex_len);
+    send_frame(TYPE_KEYIMAGES_OUT, g_resp_hex, resp_hex_len);
+    send_diag_line("outputs: DONE tx_sent=%u rx:ok=%u bad=%u",
+                   (unsigned)g_tx_sent,
+                   (unsigned)rx_frames_ok,
+                   (unsigned)rx_frames_bad);
+}
+
+// ---------------------------------------------------------------------------
+// tx.bin handler
+// ---------------------------------------------------------------------------
+static void handle_tx_bin(const uint8_t *payload, uint16_t len) {
+    send_diag_line("tx: STAGE 1/4 - hex payload, %u bytes", (unsigned)len);
+
+    uint32_t t0 = millis();
+    int bin_len = hex_decode(payload, len, g_resp_bin, MAX_BIN_PAYLOAD);
+    if (bin_len < 0) { send_error("tx hex decode failed"); return; }
+    send_diag_line("tx: STAGE 2/4 - decoded %d bytes in %u ms",
+                   bin_len, (unsigned)(millis() - t0));
+    if (bin_len == 0) { send_error("tx empty"); return; }
+
+    if (bin_len >= 24) {
+        char hex[49];
+        for (int i = 0; i < 24; i++) sprintf(hex + i*2, "%02x", g_resp_bin[i]);
+        hex[48] = 0;
+        char ascii[25];
+        for (int i = 0; i < 24; i++) {
+            uint8_t c = g_resp_bin[i];
+            ascii[i] = (c >= 0x20 && c <= 0x7e) ? (char)c : '.';
+        }
+        ascii[24] = 0;
+        send_diag_line("tx: first24 hex=%s", hex);
+        send_diag_line("tx: first24 asc='%s'", ascii);
+    }
+
+    size_t out_len = 0;
+    t0 = millis();
+    bool ok = sign_transaction(g_resp_bin, (size_t)bin_len,
+                               g_tx_signed_buf, MAX_BIN_PAYLOAD,
+                               &out_len);
+    send_diag_line("tx: STAGE 3/4 - sign_transaction: %s, out=%u bytes in %u ms",
+                   ok ? "OK" : "FAIL", (unsigned)out_len,
+                   (unsigned)(millis() - t0));
+
+    if (!ok) { send_error("sign_transaction failed"); return; }
+
+    uint16_t resp_hex_len = hex_encode(g_tx_signed_buf, out_len,
+                                       g_tx_signed_hex, MAX_HEX_PAYLOAD);
+    if (resp_hex_len == 0) { send_error("encode tx_signed too big"); return; }
+
+    send_diag_line("tx: STAGE 4/4 - hex %u bytes, sending TX_SIGNED",
+                   (unsigned)resp_hex_len);
+    send_frame(TYPE_TX_SIGNED, g_tx_signed_hex, resp_hex_len);
+    send_diag_line("tx: DONE tx_sent=%u rx:ok=%u bad=%u",
+                   (unsigned)g_tx_sent,
+                   (unsigned)rx_frames_ok,
+                   (unsigned)rx_frames_bad);
+}
+
+// ---------------------------------------------------------------------------
+// Расшифровка signed/unsigned tx set
+// ---------------------------------------------------------------------------
+static void handle_decrypt_tx_set(const uint8_t *payload, uint16_t len) {
+    send_diag_line("decrypt: ENTER, payload_len=%u", (unsigned)len);
+    send_diag_line("decrypt: free_heap=%u free_psram=%u",
+                   (unsigned)ESP.getFreeHeap(),
+                   (unsigned)ESP.getFreePsram());
+
+    // [1/6] hex_decode
+    send_diag_line("decrypt: [1/6] hex_decode start");
+    uint32_t t0 = millis();
+    int bin_len = hex_decode(payload, len, g_resp_bin, MAX_BIN_PAYLOAD);
+    send_diag_line("decrypt: [1/6] done in %u ms, bin_len=%d",
+                   (unsigned)(millis() - t0), bin_len);
+    if (bin_len < 0) { send_error("decrypt: hex decode failed"); return; }
+    if (bin_len < 32) { send_error("decrypt: input too short"); return; }
+
+    // [2/6] detect magic
+    send_diag_line("decrypt: [2/6] detect magic");
+    const uint8_t *in = g_resp_bin;
+    size_t in_len = (size_t)bin_len;
+
+    {
+        char hexbuf[68];
+        int p = 0;
+        for (int i = 0; i < 32 && i < bin_len; i++)
+            p += sprintf(hexbuf + p, "%02x", in[i]);
+        send_diag_line("decrypt: first32=%s", hexbuf);
+    }
+
+    static const char MAGIC_SIGNED[]   = "Monero signed tx set";
+    static const char MAGIC_UNSIGNED[] = "Monero unsigned tx set";
+    const size_t MLEN_SIGNED   = sizeof(MAGIC_SIGNED) - 1;
+    const size_t MLEN_UNSIGNED = sizeof(MAGIC_UNSIGNED) - 1;
+
+    size_t magic_len = 0;
+    if (in_len > MLEN_SIGNED && memcmp(in, MAGIC_SIGNED, MLEN_SIGNED) == 0) {
+        magic_len = MLEN_SIGNED;
+        send_diag_line("decrypt: format=signed tx set");
+    } else if (in_len > MLEN_UNSIGNED && memcmp(in, MAGIC_UNSIGNED, MLEN_UNSIGNED) == 0) {
+        magic_len = MLEN_UNSIGNED;
+        send_diag_line("decrypt: format=unsigned tx set");
+    } else {
+        send_error("decrypt: unknown magic");
+        return;
+    }
+
+    // [3/6] version + iv + ct
+    const uint8_t version = in[magic_len];
+    send_diag_line("decrypt: [3/6] version=0x%02x", (unsigned)version);
+    if (version != 0x05) { send_error("decrypt: unsupported version"); return; }
+
+    // Локальные имена переименованы, чтобы не пересекаться с макросами
+    // IV_LEN и SIG_LEN из outputs_parser.h.
+    const size_t kIvLen  = 8;
+    const size_t kSigLen = 64;
+
+    const size_t body_off = magic_len + 1;
+    if (in_len < body_off + kIvLen + kSigLen) {
+        send_error("decrypt: truncated body");
+        return;
+    }
+
+    const uint8_t *iv = in + body_off;
+    const uint8_t *ct = iv + kIvLen;
+    size_t ct_len = in_len - body_off - kIvLen - kSigLen;
+
+    {
+        char hexbuf[32];
+        int p = 0;
+        for (int i = 0; i < 8; i++) p += sprintf(hexbuf + p, "%02x", iv[i]);
+        send_diag_line("decrypt: iv=%s", hexbuf);
+    }
+    send_diag_line("decrypt: ct_len=%u", (unsigned)ct_len);
+    if (ct_len == 0) { send_error("decrypt: empty ct"); return; }
+
+    // [4/6] cn_slow_hash
+    send_diag_line("decrypt: [4/6] cn_slow_hash(view_sk) start");
+    uint8_t chacha_key[32];
+    t0 = millis();
+    cn_slow_hash(g_view_secret_key, 32, (char *)chacha_key, 0, 0, 0);
+    send_diag_line("decrypt: [4/6] cn_slow_hash done in %u ms",
+                   (unsigned)(millis() - t0));
+
+    // [5/6] chacha20
+    send_diag_line("decrypt: [5/6] chacha20 decrypt %u bytes start",
+                   (unsigned)ct_len);
+    uint8_t *pt = (uint8_t *)malloc(ct_len);
+    if (!pt) {
+        memset(chacha_key, 0, 32);
+        send_error("decrypt: OOM for pt");
+        return;
+    }
+    t0 = millis();
+    monero_chacha20(ct, ct_len, chacha_key, iv, pt);
+    memset(chacha_key, 0, 32);
+    send_diag_line("decrypt: [5/6] chacha20 done in %u ms",
+                   (unsigned)(millis() - t0));
+
+    {
+        char hexbuf[68];
+        int p = 0;
+        for (int i = 0; i < 32 && (size_t)i < ct_len; i++)
+            p += sprintf(hexbuf + p, "%02x", pt[i]);
+        send_diag_line("decrypt: pt[:32]=%s", hexbuf);
+    }
+
+    // [6/6] отправить plaintext
+    send_diag_line("decrypt: [6/6] sending plaintext in chunks...");
+    size_t off = 0;
+    int chunk_num = 0;
+    while (off < ct_len) {
+        size_t chunk = ct_len - off;
+        if (chunk > 4096) chunk = 4096;
+        chunk_num++;
+        send_diag_line("decrypt: sending chunk #%d (%u bytes, offset=%u)",
+                       chunk_num, (unsigned)chunk, (unsigned)off);
+        send_frame(TYPE_DECRYPT_TX_OUT, pt + off, (uint16_t)chunk);
+        off += chunk;
+        delay(10);
+    }
+
+    send_diag_line("decrypt: DONE, plaintext sent (%u bytes, %d chunks)",
+                   (unsigned)ct_len, chunk_num);
+
+    send_frame(TYPE_DECRYPT_TX_END, (const uint8_t *)"END", 3);
+    send_diag_line("decrypt: END marker sent");
+
+    memset(pt, 0, ct_len);
+    free(pt);
+}
+
+// ---------------------------------------------------------------------------
+// Диспетчер
+// ---------------------------------------------------------------------------
+static void handle_frame(uint8_t type, const uint8_t *payload, uint16_t len) {
+    send_diag_line("rx: frame type=0x%02x len=%u", (unsigned)type, (unsigned)len);
+    switch (type) {
+        case TYPE_PING:
+            send_frame(TYPE_PONG, (const uint8_t *)"PONG", 4);
+            break;
+
+        case TYPE_GET_SPEND_PUBKEY: {
+            uint8_t out_hex[64];
+            hex_encode(g_spend_public_key, 32, out_hex, sizeof(out_hex));
+            send_frame(TYPE_SPEND_PUBKEY_OUT, out_hex, 64);
+            break;
+        }
+
+        case TYPE_OUTPUTS_BIN:
+            handle_outputs_bin(payload, len);
+            break;
+
+        case TYPE_TX_BIN:
+            handle_tx_bin(payload, len);
+            break;
+
+        case TYPE_DECRYPT_TX_SET:
+            handle_decrypt_tx_set(payload, len);
+            break;
+
+        default:
+            send_error("unknown type");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cn_slow_hash self-test
+// ---------------------------------------------------------------------------
+static void test_cn_slow_hash() {
+    platform_log("selftest: cn_slow_hash start");
+
+    const char *msg = "This is a test";
+    char out[32];
+    uint32_t t0 = millis();
+    cn_slow_hash(msg, 14, out, 0, 0, 0);
+    uint32_t dt = millis() - t0;
+
+    static const uint8_t expected[32] = {
+        0xa0,0x84,0xf0,0x1d,0x14,0x37,0xa0,0x9c,
+        0x69,0x85,0x40,0x1b,0x60,0xd4,0x35,0x54,
+        0xae,0x10,0x58,0x02,0xc5,0xf5,0xd8,0xa9,
+        0xb3,0x25,0x36,0x49,0xc0,0xbe,0x66,0x05
+    };
+
+    char hexgot[65];
+    for (int i = 0; i < 32; i++) sprintf(hexgot + i*2, "%02x", (uint8_t)out[i]);
+    hexgot[64] = 0;
+
+    send_diag_line("selftest: took %u ms", (unsigned)dt);
+    send_diag_line("selftest: got %s", hexgot);
+
+    if (memcmp(out, expected, 32) == 0) {
+        platform_log("selftest: OK");
+    } else {
+        platform_log("selftest: FAIL");
+        led_set(LED_ERROR);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Аллокация буферов
+// ---------------------------------------------------------------------------
+static bool alloc_buffers() {
+    if (g_resp_bin && g_tx_signed_buf &&
+        g_rx_payload && g_resp_hex && g_tx_signed_hex) return true;
+
+    // Критичные -> SRAM
+    g_resp_bin      = (uint8_t *)heap_caps_malloc(MAX_BIN_PAYLOAD,
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    g_tx_signed_buf = (uint8_t *)heap_caps_malloc(MAX_BIN_PAYLOAD,
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    // Некритичные -> PSRAM
+    g_rx_payload    = (uint8_t *)heap_caps_malloc(MAX_HEX_PAYLOAD,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    g_resp_hex      = (uint8_t *)heap_caps_malloc(MAX_HEX_PAYLOAD,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    g_tx_signed_hex = (uint8_t *)heap_caps_malloc(MAX_HEX_PAYLOAD,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!g_resp_bin || !g_tx_signed_buf ||
+        !g_rx_payload || !g_resp_hex || !g_tx_signed_hex) {
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Device info
+// ---------------------------------------------------------------------------
+static void dump_device_info() {
+    send_diag_line("=== MoneroColdWallet boot ===");
+    send_diag_line("chip=%s rev=%d cores=%d",
+                   ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
+    send_diag_line("cpu_freq=%u MHz", (unsigned)getCpuFrequencyMhz());
+    send_diag_line("sdk=%s", ESP.getSdkVersion());
+    send_diag_line("heap_total=%u free=%u max_alloc=%u",
+                   (unsigned)ESP.getHeapSize(),
+                   (unsigned)ESP.getFreeHeap(),
+                   (unsigned)ESP.getMaxAllocHeap());
+    if (psramFound()) {
+        send_diag_line("psram=yes total=%u free=%u",
+                       (unsigned)ESP.getPsramSize(),
+                       (unsigned)ESP.getFreePsram());
+    } else {
+        send_diag_line("psram=NO — большие буферы не разместятся!");
+    }
+    send_diag_line("sizeof(ge_p3)=%u", (unsigned)sizeof(ge_p3));
+    send_diag_line("sizeof(unsigned_tx_set_t)=%u",
+                   (unsigned)sizeof(unsigned_tx_set_t));
+    send_diag_line("MAX_HEX_PAYLOAD=%u MAX_BIN_PAYLOAD=%u",
+                   (unsigned)MAX_HEX_PAYLOAD, (unsigned)MAX_BIN_PAYLOAD);
+    send_diag_line("SRAM buffers: resp_bin=%u tx_signed_buf=%u",
+                   (unsigned)MAX_BIN_PAYLOAD, (unsigned)MAX_BIN_PAYLOAD);
+    send_diag_line("PSRAM buffers: rx_payload/resp_hex/tx_signed_hex=%u each",
+                   (unsigned)MAX_HEX_PAYLOAD);
+    send_diag_line("keys: spend=%02x%02x%02x%02x... view=%02x%02x%02x%02x...",
+                   g_spend_public_key[0], g_spend_public_key[1],
+                   g_spend_public_key[2], g_spend_public_key[3],
+                   g_view_public_key[0],  g_view_public_key[1],
+                   g_view_public_key[2],  g_view_public_key[3]);
+}
+
+// ---------------------------------------------------------------------------
+// setup / loop
+// ---------------------------------------------------------------------------
+void setup() {
+        esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = 60000,
+        .idle_core_mask = (1 << 0) | (1 << 1),  // оба ядра
+        .trigger_panic = true
+    };
+    esp_task_wdt_reconfigure(&wdt_config);
+    
+    // ...
+
+    // === КРИТИЧНО ДЛЯ БЕЗОПАСНОСТИ — должно идти первым ===
+    // На ESP32-S3 аппаратный ГСЧ выдаёт настоящую случайность, только если
+    // включена RF-подсистема (WiFi/BT) либо вызван bootloader_random_enable()
+    // (источник — SAR ADC). Иначе ESP-IDF прямо документирует выход как
+    // "pseudo-random only". Отсюда берутся нонсы CLSAG: в подписи
+    // s[l] = a − c·(mu_P·p + mu_C·z), где s[l] и c лежат в транзакции открыто,
+    // так что предсказуемое a отдаёт spend-ключ одной строчкой арифметики.
+    //
+    // Пока энтропия включена, нельзя трогать ADC и RF. В этой прошивке нет ни
+    // того, ни другого, поэтому включаем один раз и навсегда:
+    // bootloader_random_disable() здесь вызывать НЕЛЬЗЯ.
+    bootloader_random_enable();
+
+    // Увеличиваем UART буферы ДО Serial.begin
+ //   Serial.setRxBufferSize(16384);
+ //   Serial.setTxBufferSize(16384);
+    Serial.begin(115200);
+    delay(500);
+
+    uint32_t t0 = millis();
+    while (!Serial && millis() - t0 < 2000) delay(10);
+
+    platform_log("boot: Serial up @115200");
+
+    if (!rng_selftest()) {
+        platform_log("FATAL: RNG selftest failed — подписывать нельзя");
+        for (;;) delay(1000);
+    }
+    platform_log("boot: RNG entropy source enabled, selftest OK");
+
+    if (!alloc_buffers()) {
+        platform_log("FATAL: cannot allocate buffers");
+        return;
+    }
+    platform_log("boot: buffers allocated (SRAM: resp_bin, tx_signed_buf; PSRAM: rest)");
+
+    if (!hex_to_bytes(SPEND_SECRET_KEY_HEX, g_spend_secret_key, 32)) {
+        platform_log("FATAL: invalid SPEND_SECRET_KEY_HEX");
+        return;
+    }
+    if (!hex_to_bytes(VIEW_SECRET_KEY_HEX, g_view_secret_key, 32)) {
+        platform_log("FATAL: invalid VIEW_SECRET_KEY_HEX");
+        return;
+    }
+
+    ge_p3 pub_p3;
+    ge_scalarmult_base(&pub_p3, g_spend_secret_key);
+    ge_p3_tobytes(g_spend_public_key, &pub_p3);
+
+    ge_p3 vpub_p3;
+    ge_scalarmult_base(&vpub_p3, g_view_secret_key);
+    ge_p3_tobytes(g_view_public_key, &vpub_p3);
+
+    dump_device_info();
+
+    platform_log("boot: keys loaded, running cn_slow_hash self-test...");
+    test_cn_slow_hash();
+    platform_log("boot: ready, waiting for frames");
+}
+
+void loop() {
+    rx_poll();
+    delay(1);
+}

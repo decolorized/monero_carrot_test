@@ -1,0 +1,101 @@
+--- a/src/libwalletqt/Wallet.h
++++ b/src/libwalletqt/Wallet.h
+@@ -279,7 +279,10 @@
+     Q_INVOKABLE UnsignedTransaction * loadTxFile(const QString &fileName);
+ 
+     //! Submit a transfer from file
+-    Q_INVOKABLE bool submitTxFile(const QString &fileName) const;
++    Q_INVOKABLE bool submitTxFile(const QString &fileName);
++
++    //! Submit a transfer from file in a worker thread; emits txFileSubmitted
++    Q_INVOKABLE void submitTxFileAsync(const QString &fileName);
+ 
+     //! asynchronous transaction commit
+     Q_INVOKABLE void commitTransactionAsync(PendingTransaction * t);
+@@ -413,6 +416,7 @@
+     void deviceButtonPressed();
+     void walletPassphraseNeeded(bool onDevice);
+     void transactionCommitted(bool status, PendingTransaction *t, const QStringList& txid);
++    void txFileSubmitted(bool success, const QString &error);
+     void heightRefreshed(quint64 walletHeight, quint64 daemonHeight, quint64 targetHeight) const;
+     void deviceShowAddressShowed();
+ 
+--- a/src/libwalletqt/Wallet.cpp
++++ b/src/libwalletqt/Wallet.cpp
+@@ -747,13 +747,34 @@
+     return result;
+ }
+ 
+-bool Wallet::submitTxFile(const QString &fileName) const
++bool Wallet::submitTxFile(const QString &fileName)
+ {
+     qDebug() << "Trying to submit " << fileName;
+-    if (!m_walletImpl->submitTransaction(fileName.toStdString()))
+-        return false;
+-    // import key images
+-    return m_walletImpl->importKeyImages(fileName.toStdString() + "_keyImages");
++    {
++        // Same lock as refresh(): finalizing the signed set reads and updates
++        // the wallet state that the refresh thread changes.
++        QMutexLocker locker(&m_asyncMutex);
++
++        if (!m_walletImpl->submitTransaction(fileName.toStdString()))
++            return false;
++        // import key images
++        if (!m_walletImpl->importKeyImages(fileName.toStdString() + "_keyImages"))
++            return false;
++    }
++    m_refreshNow = true;
++    return true;
++}
++
++void Wallet::submitTxFileAsync(const QString &fileName)
++{
++    const auto future = m_scheduler.run([this, fileName] {
++        const bool success = submitTxFile(fileName);
++        emit txFileSubmitted(success, success ? QString() : errorString());
++    });
++    if (!future.first)
++    {
++        emit txFileSubmitted(false, QStringLiteral("Wallet is closing"));
++    }
+ }
+ 
+ void Wallet::commitTransactionAsync(PendingTransaction *t)
+--- a/pages/Transfer.qml
++++ b/pages/Transfer.qml
+@@ -1067,17 +1067,25 @@
+         nameFilters: [ "signed transfers (*)"]
+ 
+         onAccepted: {
+-            if(!currentWallet.submitTxFile(walletManager.urlToLocalPath(selectedFile))){
+-                informationPopup.title = qsTr("Error") + translationManager.emptyString;
+-                informationPopup.text  = qsTr("Can't submit transaction: ") + currentWallet.errorString
++            // Finalizing a signed FCMP++ set builds the membership proof and
++            // can take a while: do it off the UI thread.
++            var wallet = currentWallet;
++            var onSubmitted = function(success, error) {
++                wallet.txFileSubmitted.disconnect(onSubmitted);
++                appWindow.hideProcessingSplash();
++                if (!success) {
++                    informationPopup.title = qsTr("Error") + translationManager.emptyString;
++                    informationPopup.text  = qsTr("Can't submit transaction: ") + error
++                } else {
++                    informationPopup.title = qsTr("Information") + translationManager.emptyString
++                    informationPopup.text  = qsTr("Monero sent successfully") + translationManager.emptyString
++                }
+                 informationPopup.onCloseCallback = null
+                 informationPopup.open();
+-            } else {
+-                informationPopup.title = qsTr("Information") + translationManager.emptyString
+-                informationPopup.text  = qsTr("Monero sent successfully") + translationManager.emptyString
+-                informationPopup.onCloseCallback = null
+-                informationPopup.open();
+-            }
++            };
++            wallet.txFileSubmitted.connect(onSubmitted);
++            appWindow.showProcessingSplash(qsTr("Submitting transaction...") + translationManager.emptyString);
++            wallet.submitTxFileAsync(walletManager.urlToLocalPath(selectedFile));
+         }
+         onRejected: {
+             console.log("Canceled")

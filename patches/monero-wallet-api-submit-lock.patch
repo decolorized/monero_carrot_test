@@ -1,0 +1,41 @@
+--- a/src/wallet/api/wallet.cpp
++++ b/src/wallet/api/wallet.cpp
+@@ -1169,12 +1169,26 @@
+     return false;
+   std::unique_ptr<PendingTransactionImpl> transaction(new PendingTransactionImpl(*this));
+ 
+-  bool r = m_wallet->prepare_tx_from_signed(fileName, transaction->m_pending_tx);
+-  if (!r) {
+-    setStatus(Status_Ok, tr("Failed to load transaction from file"));
++  // The signed set is finalized here (FCMP++ membership proof from the tree
++  // cache, BP+, key image import into m_transfers). The refresh thread mutates
++  // the same state, so wait for any refresh in progress and keep it out.
++  boost::lock_guard<boost::mutex> refresh_guard(m_refreshMutex2);
++
++  try
++  {
++    bool r = m_wallet->prepare_tx_from_signed(fileName, transaction->m_pending_tx);
++    if (!r) {
++      setStatusError(tr("Failed to load transaction from file"));
++      return false;
++    }
++  }
++  catch (const std::exception &e)
++  {
++    LOG_ERROR("Failed to load signed transaction: " << e.what());
++    setStatusError(string(tr("Failed to load transaction from file: ")) + e.what());
+     return false;
+   }
+-  
++
+   if(!transaction->commit()) {
+     setStatusError(transaction->m_errorString);
+     return false;
+@@ -1218,6 +1232,7 @@
+     setStatusError(tr("Key images can only be imported with a trusted daemon"));
+     return false;
+   }
++  boost::lock_guard<boost::mutex> refresh_guard(m_refreshMutex2);
+   try
+   {
+     uint64_t spent = 0, unspent = 0;
